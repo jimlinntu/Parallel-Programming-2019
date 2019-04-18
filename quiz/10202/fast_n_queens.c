@@ -20,6 +20,7 @@ short ok(const Mask *mask, int row){
     int pos_mask = (1 << row); // left shift `row` times
     return ((mask->row_mask & pos_mask) == 0 && (mask->diag_mask & pos_mask) == 0 && (mask->rdiag_mask & pos_mask) == 0);
 }
+// [*] Can be seen as putting queen at `row` index and move forward to next column
 Mask update_mask(Mask mask, int row){
     mask.row_mask |= 1 << row; // record this row is occupied
     mask.diag_mask = (mask.diag_mask | (1 << row)) >> 1; // decrease index
@@ -30,7 +31,7 @@ Mask update_mask(Mask mask, int row){
 short check_obstacle(int index, ULL obstacle[]){
     return (obstacle[index >> 6] & (1ULL << (index & 63))) == 0ULL;
 }
-int fastNQueens(int N, ULL pos, int now_col, ULL obstacle[], const Mask *mask){
+int fastNQueens(int N, int now_col, ULL obstacle[], const Mask *mask){
     // find one solution
     if(now_col >= N) return 1;
     // search
@@ -42,12 +43,8 @@ int fastNQueens(int N, ULL pos, int now_col, ULL obstacle[], const Mask *mask){
         index = i * N + now_col;
         // if ok() and no obstacle
         if(ok(mask, i) && check_obstacle(index, obstacle)){
-            // clear bit(1111 left shift (col * 4) 
-            pos &= ~(15ULL << (now_col << 2));
-            // or  
-            pos |= ((ULL)i) << (now_col << 2);
             local_mask = update_mask(*mask, i); // [*] update mask to next row
-            sol_num += fastNQueens(N, pos, now_col+1, obstacle, &local_mask);
+            sol_num += fastNQueens(N, now_col+1, obstacle, &local_mask);
         }
     }
     return sol_num;
@@ -86,26 +83,20 @@ int main(){
     for(int i = 0; i < caseNum; i++){
         int localN = N[i];
         int sol_num = 0;
-#pragma omp parallel
-        {
-#pragma omp for collapse(2) schedule(dynamic) reduction(+:sol_num)
-            for(int j = 0; j < localN; j++){
-                for(int k = 0; k < localN; k++){
-                        int col_0_index = j * localN;
-                        int col_1_index = k * localN + 1;
-                        // if both obstacle are not valid
-                        if(!check_obstacle(col_0_index, obstacle[i]) || 
-                                !check_obstacle(col_1_index, obstacle[i])) continue;
-                        // if these two queen will attack each other
-                        ULL pos = 0;
-                        Mask mask = {0, 0 ,0};
-                        pos |= ((ULL)j) << (0 << 2); // place 0 column queen
-                        mask = update_mask(mask, j); // update 0 column mask
-                        if(!ok(&mask, k)) continue; // check whether row `k` can be put there
-                        pos |= ((ULL)k) << (1 << 2); // place 1 column queen
-                        mask = update_mask(mask, k); // update 1 column mask
-                        sol_num += fastNQueens(localN, pos, 2, obstacle[i], &mask);
-                }
+#pragma omp parallel for collapse(2) schedule(dynamic) reduction(+:sol_num)
+        for(int j = 0; j < localN; j++){
+            for(int k = 0; k < localN; k++){
+                    int col_0_index = j * localN;
+                    int col_1_index = k * localN + 1;
+                    // if both obstacle are not valid
+                    if(!check_obstacle(col_0_index, obstacle[i]) || 
+                            !check_obstacle(col_1_index, obstacle[i])) continue;
+                    // if these two queen will attack each other
+                    Mask mask = {0, 0 ,0};
+                    mask = update_mask(mask, j); // update 0 column mask
+                    if(!ok(&mask, k)) continue; // check whether row `k` can be put there
+                    mask = update_mask(mask, k); // update 1 column mask
+                    sol_num += fastNQueens(localN, 2, obstacle[i], &mask);
             }
         }
         printf("Case %d: %d\n", i+1, sol_num);
