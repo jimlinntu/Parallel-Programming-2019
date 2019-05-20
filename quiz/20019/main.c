@@ -15,8 +15,8 @@
 #define CHUNK_SIZE (1 << (CHUNK_POWER)) 
 // maxgroup = 2^(maxn_power - chunk_power)
 #define MAXGROUP (1 << (MAXN_POWER-CHUNK_POWER))
-#define GROUP_STRIDE 256
-#define DEVICE_NUM 2
+#define GROUP_STRIDE 256 // How many number of groups you want to collapse together and then perform tree sum
+#define DEVICE_NUM 1
 cl_int status;
 
 typedef struct Keys_{
@@ -109,7 +109,12 @@ void dynamic_link_params(cl_kernel *kernel, Keys *keys, cl_int *N){
     status = clSetKernelArg(*kernel, 4, sizeof(N[0]), (void *)&N[0]);
     assert(status == CL_SUCCESS);
 }
-void enqueueCommand(cl_command_queue *commandQueue, cl_kernel *kernel, int dim, size_t *global_work_size, size_t *local_work_size, size_t *group_number, cl_int N[]){
+void enqueueCommand(cl_command_queue commandQueue[DEVICE_NUM], cl_kernel kernel[DEVICE_NUM], int dim, size_t *global_work_size, size_t *local_work_size, size_t *group_number, cl_int N[], cl_int group_offsets[DEVICE_NUM], int *group_stride_workload){
+    /* Three stages padding:
+     * 1. work-item
+     * 2. group
+     * 3. group stride
+     * */
     // save group numbers
     for(int i = 0; i < dim; i++){
         // ceil
@@ -117,7 +122,7 @@ void enqueueCommand(cl_command_queue *commandQueue, cl_kernel *kernel, int dim, 
             group_number[i] = (N[i] / local_work_size[i]) + 1;
         }
         else group_number[i] = N[i] / local_work_size[i];
-        
+        // work-item padding
         global_work_size[i] = group_number[i] * local_work_size[i];
 #ifdef DEBUG
         printf("%lu\n", group_number[i]);
@@ -127,17 +132,52 @@ void enqueueCommand(cl_command_queue *commandQueue, cl_kernel *kernel, int dim, 
     // group padding 
     if(group_number[0] % GROUP_STRIDE != 0){
         int num_pad_group = GROUP_STRIDE - (group_number[0] % GROUP_STRIDE);
-        global_work_size[0] = local_work_size[0] * (group_number[0] + num_pad_group) / GROUP_STRIDE;
-        group_number[0] += num_pad_group; // add the number of padding group
+        group_number[0] += num_pad_group; // add the number of padding group. However it will not affect the result
+        global_work_size[0] = local_work_size[0] * group_number[0] / GROUP_STRIDE;
     }else{
         global_work_size[0] = local_work_size[0] * group_number[0] / GROUP_STRIDE;
     }
-    status = clEnqueueNDRangeKernel(*commandQueue, *kernel, dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
-    assert(status == CL_SUCCESS);
+    
+    // Divide work to each CPU(GPU) device (group stride padding)
+    // [*] Number of group stride
+    int group_stride_num = (group_number[0] / GROUP_STRIDE); // Note: this number will be divisible
+    assert(group_number[0] % GROUP_STRIDE == 0);
+    // [*] group_stride_workload = What is the number of group stride handled by one device?
+    *group_stride_workload = (group_stride_num % DEVICE_NUM == 0)? (group_stride_num / DEVICE_NUM):(group_stride_num / DEVICE_NUM + 1);
+    assert((*group_stride_workload * DEVICE_NUM -  group_stride_num + (group_stride_num % *group_stride_workload)) % *group_stride_workload == 0);
+
+    for(int i = 0; i < DEVICE_NUM; i++){
+        group_offsets[i] = *group_stride_workload * i * GROUP_STRIDE; // ex. when 256 + 256 + 253 group => DEVICE == 2, group_workload = 2, and group_offsets[1] == 2 * 1 * GROUP_STRIDE
+        // TODO: may be bug?
+        global_work_size[0] = local_work_size[0] * (*group_stride_workload);  // How many work item does this device need to finish? 
+        status = clSetKernelArg(kernel[i], 5, sizeof(group_offsets[i]), (void *)&group_offsets[i]); // pass group offset into kernel
+        assert(status == CL_SUCCESS);
+        status = clEnqueueNDRangeKernel(commandQueue[i], kernel[i], dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+        assert(status == CL_SUCCESS);
+    }
+
+    // [*] Wait for all event finish
+    for(int i = 0; i < DEVICE_NUM; i++){
+        clFinish(commandQueue[i]);
+    }
 }
-void readResult(cl_command_queue *commandQueue, cl_mem *arrayBuffer, cl_uint array[]){
-    status = clEnqueueReadBuffer(*commandQueue, *arrayBuffer, CL_TRUE, 0, MAXGROUP * sizeof(array[0]), array, 0, NULL, NULL);
-    assert(status == CL_SUCCESS);
+void readResult(cl_command_queue commandQueue[], cl_mem *arrayBuffer, cl_uint array[], size_t group_number[], cl_int group_offsets[DEVICE_NUM], int group_stride_workload){
+    // [*] The host should read results from each devices from different offset, because they use the same buffer to write
+    int group_stride_num = (group_number[0] / GROUP_STRIDE); // Note: this number will be divisible
+    assert(group_number[0] % GROUP_STRIDE == 0);
+    for(int i = 0; i < DEVICE_NUM; i++){
+        int array_offset_index = group_offsets[i]; // group_offset index
+        size_t offset = sizeof(array[0]) * group_offsets[i];  // group offset but in bytes (rather than index)
+        size_t bytes_being_read;
+        if(i != DEVICE_NUM - 1) bytes_being_read = sizeof(array[0]) * group_stride_workload * GROUP_STRIDE; 
+        else if(group_stride_num % group_stride_workload != 0){
+            bytes_being_read = sizeof(array[0]) * (group_stride_num % group_stride_workload) * GROUP_STRIDE; // only last device may have less workload
+        }else{
+            bytes_being_read = sizeof(array[0]) * (group_stride_workload) * GROUP_STRIDE; // only last device may have less workload
+        }
+        status = clEnqueueReadBuffer(commandQueue[i], *arrayBuffer, CL_TRUE, offset, bytes_being_read, array+array_offset_index, 0, NULL, NULL);
+        assert(status == CL_SUCCESS);
+    }
 }
 void updateBuffer(cl_command_queue *commandQueue, cl_mem *keybuffer1, cl_mem *keybuffer2, cl_mem *NBuffer, 
                 Keys *keys, cl_int N[]){
@@ -148,13 +188,18 @@ void updateBuffer(cl_command_queue *commandQueue, cl_mem *keybuffer1, cl_mem *ke
     status = clEnqueueWriteBuffer(*commandQueue, *NBuffer, CL_TRUE, 0, 1 * sizeof(N[0]), N, 0, NULL, NULL);
     assert(status == CL_SUCCESS);
 }
-void releaseAll(cl_uint *array, cl_context *context, cl_command_queue *commandQueue, 
-        cl_program *program, cl_kernel *kernel, cl_mem *arrayBuffer){
+void releaseAll(cl_uint *array, cl_context *context, cl_command_queue commandQueue[DEVICE_NUM], 
+        cl_program *program, cl_kernel kernel[DEVICE_NUM], cl_mem *arrayBuffer){
     free(array);
     clReleaseContext(*context);
-    clReleaseCommandQueue(*commandQueue);
+    for(int i = 0; i < DEVICE_NUM; i++){
+        clReleaseCommandQueue(commandQueue[i]);
+    }
     clReleaseProgram(*program);
-    clReleaseKernel(*kernel);
+
+    for(int i = 0; i < DEVICE_NUM; i++){
+        clReleaseKernel(kernel[i]);
+    }
     clReleaseMemObject(*arrayBuffer);
 }
 int main(){
@@ -172,7 +217,10 @@ int main(){
     size_t global_work_size[1];
     size_t local_work_size[1];
     size_t group_number[1];
+    cl_int group_offsets[DEVICE_NUM];
+    int group_stride_workload;
 #ifdef DEBUG
+    // [*] each index `i` represent one group
     cl_uint *array = (cl_uint*) calloc(MAXGROUP, sizeof(cl_uint));
 #else
     cl_uint *array = (cl_uint*) malloc(sizeof(cl_uint) * MAXGROUP);
@@ -205,12 +253,13 @@ int main(){
 #endif 
     // [*] Create kernel
     for(int i = 0; i < DEVICE_NUM; i++){
-        buildKernel(&program, "vecdot_seq_reduce_half", &kernel[i]);
+        buildKernel(&program, "vecdot_load_balance", &kernel[i]);
     }
     // [*] Create buffer
     // TODO: DEBUG
     buildBuffers(&context, &arrayBuffer, array);
     // [*] Parameter linking
+#pragma omp parallel for
     for(int i = 0; i < DEVICE_NUM; i++){
         static_link_params(&kernel[i], &arrayBuffer);
     }
@@ -222,11 +271,14 @@ int main(){
         local_work_size[0] = CHUNK_SIZE;
 
         // [*] WARNING: remove this line will cause bug!(because of caching on devices)
-        dynamic_link_params(&kernel[0], &keys, N);
+#pragma omp parallel for
+        for(int i = 0; i < DEVICE_NUM; i++){
+            dynamic_link_params(&kernel[i], &keys, N);
+        }
         // [*] Enqueue command
-        enqueueCommand(&commandQueue[0], &kernel[0], 1, global_work_size, local_work_size, group_number, N);
+        enqueueCommand(commandQueue, kernel, 1, global_work_size, local_work_size, group_number, N, group_offsets, &group_stride_workload);
         // [*] Read 
-        readResult(&commandQueue[0], &arrayBuffer, array);
+        readResult(commandQueue, &arrayBuffer, array, group_number, group_offsets, group_stride_workload);
         // Sum over array
         int group_num = group_number[0];
         uint32_t sum = 0;
@@ -240,6 +292,6 @@ int main(){
         // [*] Check if there is a padding group
         printf("%" PRIu32 "\n", sum);
     }
-    releaseAll(array, &context, &commandQueue[0], &program, &kernel[0], &arrayBuffer);
+    releaseAll(array, &context, commandQueue, &program, kernel, &arrayBuffer);
     return 0;
 }

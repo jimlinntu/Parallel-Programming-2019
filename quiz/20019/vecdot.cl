@@ -74,3 +74,32 @@ __kernel void vecdot_seq_reduce_half(__private const uint key1, __private const 
         output[group_id] = localarray[0];
     }
 }
+__kernel void vecdot_load_balance(__private const uint key1, __private const uint key2, __local uint *localarray, __global uint *output, __private const int N, 
+                                  __private const int group_num_offset){
+    int group_id = get_group_id(0) * GROUP_STRIDE + group_num_offset; // (group_num_offset) + (group 0, group 2, group 4, ...)
+    int local_size = get_local_size(0);
+    int local_idx = get_local_id(0);
+    // NOTE: this idx is NOT equal to global_idx
+    int idx = group_id * local_size + local_idx; // ex. (group 0) * local_size + local_idx == real global idx
+    int tmpidx = idx - local_size;
+    // Initialize
+    localarray[local_idx] = 0;
+    // [*] This loop will add group that are in the distance of GROUP_STRIDE
+    for(int tmp_gidx = 0; tmp_gidx < GROUP_STRIDE; tmp_gidx++){
+        tmpidx += local_size;
+        if(tmpidx >= N) break;
+        localarray[local_idx] += encrypt((uint)tmpidx, key1) * encrypt((uint)tmpidx, key2);
+    }
+    
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int s = local_size/2; s > 0; s >>= 1){
+        if(local_idx < s){
+            localarray[local_idx] += localarray[local_idx + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    // root of local 
+    if(local_idx == 0){
+        output[group_id] = localarray[0];
+    }
+}
