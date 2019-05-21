@@ -143,13 +143,16 @@ void enqueueCommand(cl_command_queue commandQueue[DEVICE_NUM], cl_kernel kernel[
     int group_stride_num = (group_number[0] / GROUP_STRIDE); // Note: this number will be divisible
     assert(group_number[0] % GROUP_STRIDE == 0);
     // [*] group_stride_workload = What is the number of group stride handled by one device?
-    *group_stride_workload = (group_stride_num % DEVICE_NUM == 0)? (group_stride_num / DEVICE_NUM):(group_stride_num / DEVICE_NUM + 1);
-    assert((*group_stride_workload * DEVICE_NUM -  group_stride_num + (group_stride_num % *group_stride_workload)) % *group_stride_workload == 0);
+    *group_stride_workload = group_stride_num / DEVICE_NUM;
+    int group_stride_remainder = group_stride_num % DEVICE_NUM;
+    assert(group_stride_num - (*group_stride_workload * DEVICE_NUM) == group_stride_remainder);
 
     for(int i = 0; i < DEVICE_NUM; i++){
-        group_offsets[i] = *group_stride_workload * i * GROUP_STRIDE; // ex. when 256 + 256 + 253 group => DEVICE == 2, group_workload = 2, and group_offsets[1] == 2 * 1 * GROUP_STRIDE
-        // TODO: may be bug?
-        global_work_size[0] = local_work_size[0] * (*group_stride_workload);  // How many work item does this device need to finish? 
+        group_offsets[i] = *group_stride_workload * i * GROUP_STRIDE; // ex. when 256 + 256 + 253 group => DEVICE == 2, group_workload = 1, and group_offsets[1] == 1 * 1 * GROUP_STRIDE
+        if(i != DEVICE_NUM-1)
+            global_work_size[0] = local_work_size[0] * (*group_stride_workload);  // How many work item does this device need to finish? 
+        else
+            global_work_size[0] = local_work_size[0] * (*group_stride_workload + group_stride_remainder); // I give remainder to last device to handle
         status = clSetKernelArg(kernel[i], 5, sizeof(group_offsets[i]), (void *)&group_offsets[i]); // pass group offset into kernel
         assert(status == CL_SUCCESS);
         status = clEnqueueNDRangeKernel(commandQueue[i], kernel[i], dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
@@ -165,15 +168,15 @@ void readResult(cl_command_queue commandQueue[], cl_mem *arrayBuffer, cl_uint ar
     // [*] The host should read results from each devices from different offset, because they use the same buffer to write
     int group_stride_num = (group_number[0] / GROUP_STRIDE); // Note: this number will be divisible
     assert(group_number[0] % GROUP_STRIDE == 0);
+    int group_stride_remainder = group_stride_num % DEVICE_NUM;
     for(int i = 0; i < DEVICE_NUM; i++){
         int array_offset_index = group_offsets[i]; // group_offset index
         size_t offset = sizeof(array[0]) * group_offsets[i];  // group offset but in bytes (rather than index)
         size_t bytes_being_read;
         if(i != DEVICE_NUM - 1) bytes_being_read = sizeof(array[0]) * group_stride_workload * GROUP_STRIDE; 
-        else if(group_stride_num % group_stride_workload != 0){
-            bytes_being_read = sizeof(array[0]) * (group_stride_num % group_stride_workload) * GROUP_STRIDE; // only last device may have less workload
-        }else{
-            bytes_being_read = sizeof(array[0]) * (group_stride_workload) * GROUP_STRIDE; // only last device may have less workload
+        else{
+            // Last device will do more work
+            bytes_being_read = sizeof(array[0]) * (group_stride_workload + group_stride_remainder) * GROUP_STRIDE; // only last device may have less workload
         }
         status = clEnqueueReadBuffer(commandQueue[i], *arrayBuffer, CL_TRUE, offset, bytes_being_read, array+array_offset_index, 0, NULL, NULL);
         assert(status == CL_SUCCESS);
