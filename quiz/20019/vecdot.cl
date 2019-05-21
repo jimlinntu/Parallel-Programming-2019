@@ -100,6 +100,7 @@ __kernel void vecdot_load_balance(__private const uint key1, __private const uin
     }
     // root of local 
     if(local_idx == 0){
-        output[group_id] = localarray[0];
+        // [*] Note: group_num_offset should be divisible by GROUP_STRIDE
+        output[group_id / GROUP_STRIDE] = localarray[0];
     }
 }
