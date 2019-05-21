@@ -45,7 +45,7 @@ __kernel void vecdot_seq(__private uint key1, __private uint key2, __local uint 
 }
 
 // [*] This should be same as `main.c`
-#define GROUP_STRIDE 256
+#define GROUP_STRIDE 128
 __kernel void vecdot_seq_reduce_half(__private const uint key1, __private const uint key2, __local uint *localarray, __global uint *output, __private const int N){
     int group_id = get_group_id(0) * GROUP_STRIDE; // group 0, group 2, group 4, ...
     int local_size = get_local_size(0);
@@ -87,7 +87,7 @@ __kernel void vecdot_load_balance(__private const uint key1, __private const uin
     // [*] This loop will add group that are in the distance of GROUP_STRIDE
     for(int tmp_gidx = 0; tmp_gidx < GROUP_STRIDE; tmp_gidx++){
         tmpidx += local_size;
-        if(tmpidx >= N) break;
+      //  if(tmpidx >= N) break;
         localarray[local_idx] += encrypt((uint)tmpidx, key1) * encrypt((uint)tmpidx, key2);
     }
     

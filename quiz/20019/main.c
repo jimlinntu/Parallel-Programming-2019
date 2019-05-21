@@ -4,18 +4,19 @@
 #include <CL/cl.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <omp.h>
 #define MAXBUF 1000
 #define MAXCPU 100
 #define MAXK 5000
 #define MAXLOG 5000
-#define MAXN_POWER 36
-#define CHUNK_POWER 8  // 8 will not pass the time limit!!!!
+#define MAXN_POWER 30
+#define CHUNK_POWER 10  // 8 will not pass the time limit!!!!
 // chunk_size = 2^chunk_power
 #define CHUNK_SIZE (1 << (CHUNK_POWER)) 
 // maxgroup = 2^(maxn_power - chunk_power)
 #define MAXGROUP (1 << (MAXN_POWER-CHUNK_POWER))
-#define GROUP_STRIDE 256 // How many number of groups you want to collapse together and then perform tree sum
+#define GROUP_STRIDE 128 // How many number of groups you want to collapse together and then perform tree sum
 #define MAXGROUP_STRIDE_NUM (MAXGROUP / GROUP_STRIDE)
 #define DEVICE_NUM 1 // Data parallel device
 #define TASK_DEVICE_NUM 2 // Task parallel device
@@ -26,6 +27,17 @@ typedef struct Keys_{
     cl_uint key1[1];
     cl_uint key2[1];
 } Keys;
+typedef struct InputRecord_{
+    cl_int N;
+    Keys key_pair;
+} InputRecord;
+
+static inline uint32_t rotate_left(uint32_t x, uint32_t n) {
+    return  (x << n) | (x >> (32-n));
+}
+static inline uint32_t encrypt(uint32_t m, uint32_t key) {
+    return (rotate_left(m, key&31) + key)^key;
+}
 void platform(cl_platform_id *platform_id, cl_uint *platform_id_got){
     status = clGetPlatformIDs(1, platform_id, 
                     platform_id_got);
@@ -112,7 +124,7 @@ void dynamic_link_params(cl_kernel *kernel, Keys *keys, cl_int *N){
     status = clSetKernelArg(*kernel, 4, sizeof(N[0]), (void *)&N[0]);
     assert(status == CL_SUCCESS);
 }
-void enqueueCommand(cl_command_queue commandQueue[DEVICE_NUM], cl_kernel kernel[DEVICE_NUM], int dim, size_t *global_work_size, size_t *local_work_size, size_t *group_number, cl_int N[], cl_int group_offsets[DEVICE_NUM], int *group_stride_workload){
+uint32_t enqueueCommand(Keys *keys, cl_command_queue commandQueue[DEVICE_NUM], cl_kernel kernel[DEVICE_NUM], int dim, size_t *global_work_size, size_t *local_work_size, size_t *group_number, cl_int N[], cl_int group_offsets[DEVICE_NUM], int *group_stride_workload){
     /* Three stages padding:
      * 1. work-item
      * 2. group
@@ -162,6 +174,14 @@ void enqueueCommand(cl_command_queue commandQueue[DEVICE_NUM], cl_kernel kernel[
         status = clEnqueueNDRangeKernel(commandQueue[i], kernel[i], dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
         assert(status == CL_SUCCESS);
     }
+    // Add padding sum
+    uint32_t padsum = 0;
+    int end = local_work_size[0] * group_number[0]; // [*] This is the length after padding
+    for(int i = N[0]; i < end; i++){
+        padsum += encrypt(i, keys->key1[0]) * encrypt(i, keys->key2[0]);
+    }
+
+    return padsum;
 }
 void readResult(cl_command_queue commandQueue[DEVICE_NUM], cl_mem *arrayBuffer, cl_uint array[], size_t group_number[], cl_int group_offsets[DEVICE_NUM], int group_stride_workload, cl_event event[DEVICE_NUM]){
     // [*] The host should read results from each devices from different offset, because they use the same buffer to write
@@ -177,7 +197,7 @@ void readResult(cl_command_queue commandQueue[DEVICE_NUM], cl_mem *arrayBuffer, 
             // Last device will do more work
             bytes_being_read = sizeof(array[0]) * (group_stride_workload + group_stride_remainder); // only last device may have less workload
         }
-        status = clEnqueueReadBuffer(commandQueue[i], *arrayBuffer, CL_FALSE, offset, bytes_being_read, array+array_offset_index, 0, NULL, &event[i]);
+        status = clEnqueueReadBuffer(commandQueue[i], *arrayBuffer, CL_TRUE, offset, bytes_being_read, array+array_offset_index, 0, NULL, NULL);
         assert(status == CL_SUCCESS);
     }
 }
@@ -204,6 +224,7 @@ void releaseAll(cl_uint array[TASK_DEVICE_NUM][MAXGROUP_STRIDE_NUM], cl_context 
         clReleaseMemObject(arrayBuffer[i]);
     }
 }
+
 int main(){
     assert(DEVICE_NUM == 1); // data parallism deprecated
 
@@ -275,17 +296,19 @@ int main(){
     // 
     short has_task[TASK_DEVICE_NUM] = {0};
     short done = 0;
+    uint32_t padsum[TASK_DEVICE_NUM] = {0};
     while(1){
         for(int i = 0; i < TASK_DEVICE_NUM && scanf("%d %" PRIu32 " %" PRIu32, &N[i][0], &keys[i].key1[0], &keys[i].key2[0]) == 3; i++){
             local_work_size[i][0] = CHUNK_SIZE;
             dynamic_link_params(&kernel[i], &keys[i], N[i]);
             has_task[i] = 1;
-            enqueueCommand(&commandQueue[i], &kernel[i], 1, global_work_size[i], local_work_size[i], group_number[i], N[i], &group_offsets[i], &group_stride_workload[i]);
-            readResult(&commandQueue[i], &arrayBuffer[i], array[i], group_number[i], &group_offsets[i], group_stride_workload[i], &event[i]);
+            padsum[i] = enqueueCommand(&keys[i], &commandQueue[i], &kernel[i], 1, global_work_size[i], local_work_size[i], group_number[i], N[i], &group_offsets[i], &group_stride_workload[i]);
         }
         
+        for(int i = 0; i< TASK_DEVICE_NUM && has_task[i]; i++)
+            readResult(&commandQueue[i], &arrayBuffer[i], array[i], group_number[i], &group_offsets[i], group_stride_workload[i], &event[i]);
         // [*] Wait for event
-        status = clWaitForEvents(TASK_DEVICE_NUM, event);
+        //status = clWaitForEvents(TASK_DEVICE_NUM, event);
         assert(status == CL_SUCCESS);
         for(int i = 0; i < TASK_DEVICE_NUM; i++){
             if(has_task[i] == 0){
@@ -303,7 +326,7 @@ int main(){
                 printf("array[%d]: %u\n", j, array[j]);
 #endif
             }
-            printf("%" PRIu32 "\n", sum);
+            printf("%" PRIu32 "\n", sum - padsum[i]);
             has_task[i] = 0;
         }
         if(done) break;
