@@ -7,10 +7,13 @@
 #include <thrust/sort.h>
 #include <thrust/copy.h>
 #include <thrust/execution_policy.h>
+#include <iostream>
+#define MAX(x, y) ((x) < (y))? (y):(x)
 #define MAXN 10000000
 #define K 500
-#define BLOCKSIZE 1000
-#define USE_THRUST
+#define BLOCKSIZE 1024 // 1024 is faster than 512, 2048 cause bug?? (I found that it is because cuda has maximum thread per block)
+//#define USE_THRUST
+
 
 __global__ void cudaLabeling(const char *cuStr, int *cuPos, int strLen){
     // [startidx, endidx) block
@@ -82,6 +85,48 @@ __global__ void cudaLabeling_simple(const char *cuStr, int *cuPos, int strLen){
         }
     }
 }
+__global__ void cudaLabeling_fast_step_1(const char *cuStr, int *cuPos, int strLen){
+    int startidx = blockIdx.x * BLOCKSIZE;
+    int endidx = ((startidx + BLOCKSIZE) <= strLen)? (startidx + BLOCKSIZE):(strLen);
+    int trueidx = startidx + threadIdx.x;
+    __shared__ int R[2][BLOCKSIZE]; // double buffering
+    int oldBufIdx = 0, newBufIdx = 1, temp;
+    // R0
+    R[0][threadIdx.x] = (trueidx < endidx && cuStr[trueidx] == ' ')? (trueidx):(-1);
+    __syncthreads();
+    // R1
+    for(int stride = 1; stride <= 256; stride = stride << 1){
+        if((int)threadIdx.x - stride >= 0){
+            R[newBufIdx][threadIdx.x] = MAX(R[oldBufIdx][threadIdx.x], R[oldBufIdx][threadIdx.x - stride]);
+        }else R[newBufIdx][threadIdx.x] = R[oldBufIdx][threadIdx.x];
+        __syncthreads();
+        temp = oldBufIdx;
+        oldBufIdx = newBufIdx;
+        newBufIdx = temp;
+    }
+    // R2(not fix)
+    R[oldBufIdx][threadIdx.x] = (R[oldBufIdx][threadIdx.x] == -1)? (threadIdx.x+1):(trueidx - R[oldBufIdx][threadIdx.x]); // edge case: when value == -1
+    if(trueidx < endidx){
+        cuPos[trueidx] = R[oldBufIdx][threadIdx.x];
+    }
+}
+
+__global__ void cudaLabeling_fast_step_2(const char *cuStr, int *cuPos, int strLen){
+    int startidx = blockIdx.x * BLOCKSIZE;
+    //int endidx = ((startidx + BLOCKSIZE) <= strLen)? (startidx + BLOCKSIZE):(strLen);
+    if(cuStr[startidx] != ' '){
+        int prev_sum = 0;
+        if(startidx - 1 >= 0){
+            // Note: rhs may be 0 !!!!
+            prev_sum = cuPos[startidx-1]; // Because two consecutive stream of alphabets will not overlap, we can only add previous block's last element
+        }
+        if(prev_sum != 0){
+            for(int i = startidx; cuStr[i] != ' '; i++){
+                cuPos[i] += prev_sum;
+            }
+        }
+    }
+}
 template<class T> struct MM{
     const char *cuStr;
     MM(const char *cuStr_): cuStr(cuStr_) {};
@@ -99,13 +144,11 @@ template<class T> struct IndexSubtractValueOp{
     };
 };
 void labeling(const char *cuStr, int *cuPos, int strLen){
-    int blockSize = BLOCKSIZE; // a thread will compute `blockSize` elements
-    int blocksPerGrid = (strLen + blockSize - 1) / blockSize; // how many blocks do we have ( ceil() function)
-    int threadsPerBlock = 1; // each block will be only computed by one thread
 
 #ifdef USE_THRUST
     static thrust::device_vector<int> p(MAXN);
     thrust::device_ptr<int> dev_ptr_pos(cuPos);
+
     // subtract index
     thrust::tabulate(thrust::device, p.begin(), p.begin()+strLen, MM<int>(cuStr));
     // prefix maximum
@@ -115,9 +158,12 @@ void labeling(const char *cuStr, int *cuPos, int strLen){
     thrust::tabulate(thrust::device, p.begin(), p.begin()+strLen, IndexSubtractValueOp<int>(raw_p_ptr));
     thrust::copy(thrust::device, p.begin(), p.begin() + strLen, dev_ptr_pos);
 #else
-    cudaLabeling_simple<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
+    int blockSize = BLOCKSIZE; // a thread will compute `blockSize` elements
+    int blocksPerGrid = (strLen + blockSize - 1) / blockSize; // how many blocks do we have ( ceil() function)
+    int threadsPerBlock = BLOCKSIZE; // each block will be only computed by one thread
+    cudaLabeling_fast_step_1<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
+    // Fix each block
+    threadsPerBlock = 1;
+    cudaLabeling_fast_step_2<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
 #endif
-
-
-
 }
