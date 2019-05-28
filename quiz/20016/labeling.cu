@@ -22,17 +22,6 @@ __global__ void cudaLabeling(const char *cuStr, int *cuPos, int strLen){
     int endidx = ((startidx + BLOCKSIZE) <= strLen)? (startidx + BLOCKSIZE):(strLen);
     int in_range_ofEndIdx = (startidx + threadIdx.x < endidx);
     __shared__ int sharedPos[2][BLOCKSIZE]; // double buffering
-    __shared__ int p_startidx;
-    // search left side of this block (only need to search previous block when this is not an alphabet)
-    if(threadIdx.x == 0 && cuStr[startidx] != ' '){
-        p_startidx = 0;
-        for(int i = 1; i < K; i++){
-            // short-circuit logic
-            if(startidx - i >= 0 && cuStr[startidx - i] != ' '){
-                p_startidx++;
-            }else break;
-        }
-    }
     int prev_shared_pos_cache;
     if(in_range_ofEndIdx){
         prev_shared_pos_cache = sharedPos[0][threadIdx.x] = (cuStr[startidx + threadIdx.x] != ' '); // whether this position is a nonspace char
@@ -50,14 +39,10 @@ __global__ void cudaLabeling(const char *cuStr, int *cuPos, int strLen){
         oldBufIdx = newBufIdx;
         newBufIdx = temp;
     }
-    // Add all thread with `p_startidx`
+    // Not fixed version
     if(in_range_ofEndIdx){
-        if((threadIdx.x + 1) == prev_shared_pos_cache){
-            cuPos[startidx + threadIdx.x] = p_startidx + prev_shared_pos_cache;
-        }else{
-            cuPos[startidx + threadIdx.x] = prev_shared_pos_cache;
-        }
-    }
+        cuPos[startidx + threadIdx.x] = prev_shared_pos_cache;
+    } 
 }
 
 __global__ void cudaLabeling_simple(const char *cuStr, int *cuPos, int strLen){
@@ -122,19 +107,6 @@ __global__ void cudaLabeling_fast_step_2(const char *cuStr, int *cuPos, int strL
         }
     }
     return;
-    // [*] Below codes are slower because only one thread will sum up previous block's element
-    if(cuStr[startidx] != ' '){
-        int prev_sum = 0;
-        if(startidx - 1 >= 0){
-            // Note: rhs may be 0 !!!!
-            prev_sum = cuPos[startidx-1]; // Because two consecutive stream of alphabets will not overlap, we can only add previous block's last element
-        }
-        if(prev_sum != 0){
-            for(int i = startidx; cuStr[i] != ' '; i++){
-                cuPos[i] += prev_sum;
-            }
-        }
-    }
 }
 template<class T> struct MM{
     const char *cuStr;
@@ -172,7 +144,7 @@ void labeling(const char *cuStr, int *cuPos, int strLen){
     int threadsPerBlock = BLOCKSIZE; // each block will be only computed by one thread
 //    cudaLabeling<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
 //    return;
-    cudaLabeling_fast_step_1<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
+    cudaLabeling<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
     // Fix each block
     threadsPerBlock = BLOCKSIZE;
     cudaLabeling_fast_step_2<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
