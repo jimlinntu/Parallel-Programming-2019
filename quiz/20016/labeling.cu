@@ -23,8 +23,8 @@ __global__ void cudaLabeling(const char *cuStr, int *cuPos, int strLen){
     int in_range_ofEndIdx = (startidx + threadIdx.x < endidx);
     __shared__ int sharedPos[2][BLOCKSIZE]; // double buffering
     __shared__ int p_startidx;
-    // search left side of this block TODO: This part will bound performance(workaround: use block size 1024 to resolve this)
-    if(threadIdx.x == 0){
+    // search left side of this block (only need to search previous block when this is not an alphabet)
+    if(threadIdx.x == 0 && cuStr[startidx] != ' '){
         p_startidx = 0;
         for(int i = 1; i < K; i++){
             // short-circuit logic
@@ -33,17 +33,18 @@ __global__ void cudaLabeling(const char *cuStr, int *cuPos, int strLen){
             }else break;
         }
     }
+    int prev_shared_pos_cache;
     if(in_range_ofEndIdx){
-        sharedPos[0][threadIdx.x] = (cuStr[startidx + threadIdx.x] != ' '); // whether this position is a nonspace char
-    } else sharedPos[0][threadIdx.x] = 0;
+        prev_shared_pos_cache = sharedPos[0][threadIdx.x] = (cuStr[startidx + threadIdx.x] != ' '); // whether this position is a nonspace char
+    }else prev_shared_pos_cache = sharedPos[0][threadIdx.x] = 0;
     __syncthreads(); // make sure all the thread in this block sync
     int oldBufIdx = 0, newBufIdx = 1, temp; // [*] Double buffering technique
     // Tree
     for(int stride = 1; stride <= 256; stride *= 2){
-        if((int)(threadIdx.x) - stride >= 0 && sharedPos[oldBufIdx][threadIdx.x] == stride){
+        if((int)(threadIdx.x) - stride >= 0 && prev_shared_pos_cache == stride){
             // Only if the continuos character is equal to stride, we will add the value into it
-            sharedPos[newBufIdx][threadIdx.x] = sharedPos[oldBufIdx][threadIdx.x] + sharedPos[oldBufIdx][threadIdx.x - stride];
-        }else sharedPos[newBufIdx][threadIdx.x] = sharedPos[oldBufIdx][threadIdx.x];
+            prev_shared_pos_cache = sharedPos[newBufIdx][threadIdx.x] = sharedPos[oldBufIdx][threadIdx.x] + sharedPos[oldBufIdx][threadIdx.x - stride];
+        }else prev_shared_pos_cache = sharedPos[newBufIdx][threadIdx.x] = sharedPos[oldBufIdx][threadIdx.x];
         __syncthreads();
         temp = oldBufIdx;
         oldBufIdx = newBufIdx;
@@ -51,10 +52,10 @@ __global__ void cudaLabeling(const char *cuStr, int *cuPos, int strLen){
     }
     // Add all thread with `p_startidx`
     if(in_range_ofEndIdx){
-        if(sharedPos[oldBufIdx][threadIdx.x] > 0 && (threadIdx.x + 1) == sharedPos[oldBufIdx][threadIdx.x]){
-            cuPos[startidx + threadIdx.x] = p_startidx + sharedPos[oldBufIdx][threadIdx.x];
+        if((threadIdx.x + 1) == prev_shared_pos_cache){
+            cuPos[startidx + threadIdx.x] = p_startidx + prev_shared_pos_cache;
         }else{
-            cuPos[startidx + threadIdx.x] = sharedPos[oldBufIdx][threadIdx.x];
+            cuPos[startidx + threadIdx.x] = prev_shared_pos_cache;
         }
     }
 }
@@ -113,7 +114,15 @@ __global__ void cudaLabeling_fast_step_1(const char *cuStr, int *cuPos, int strL
 
 __global__ void cudaLabeling_fast_step_2(const char *cuStr, int *cuPos, int strLen){
     int startidx = blockIdx.x * BLOCKSIZE;
-    //int endidx = ((startidx + BLOCKSIZE) <= strLen)? (startidx + BLOCKSIZE):(strLen);
+    int endidx = ((startidx + BLOCKSIZE) <= strLen)? (startidx + BLOCKSIZE):(strLen);
+    if(cuStr[startidx] != ' ' && startidx - 1 >= 0){
+        // if two parts of string can meet the boundaries
+        if(startidx + threadIdx.x < endidx && threadIdx.x + 1 == cuPos[startidx + threadIdx.x]){
+            cuPos[startidx + threadIdx.x] += cuPos[startidx - 1];
+        }
+    }
+    return;
+    // [*] Below codes are slower because only one thread will sum up previous block's element
     if(cuStr[startidx] != ' '){
         int prev_sum = 0;
         if(startidx - 1 >= 0){
@@ -161,9 +170,11 @@ void labeling(const char *cuStr, int *cuPos, int strLen){
     int blockSize = BLOCKSIZE; // a thread will compute `blockSize` elements
     int blocksPerGrid = (strLen + blockSize - 1) / blockSize; // how many blocks do we have ( ceil() function)
     int threadsPerBlock = BLOCKSIZE; // each block will be only computed by one thread
+//    cudaLabeling<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
+//    return;
     cudaLabeling_fast_step_1<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
     // Fix each block
-    threadsPerBlock = 1;
+    threadsPerBlock = BLOCKSIZE;
     cudaLabeling_fast_step_2<<< blocksPerGrid, threadsPerBlock >>>(cuStr, cuPos, strLen);
 #endif
 }
