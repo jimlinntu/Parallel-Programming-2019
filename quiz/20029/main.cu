@@ -8,6 +8,7 @@
 #define MAXGPU 2
 #define MAX_TESTCASE 512
 #define THREADS_PER_BLOCK 16
+#define USE_TRANSPOSE
 // in-place transpose
 __global__ void cudaTranspose(int N, UINT target[][MAXN]){
     // Share works among row index
@@ -31,7 +32,6 @@ __global__ void cudaMultiply(int N, UINT src1[][MAXN], UINT src2[][MAXN], UINT t
     __shared__ UINT local_src2[THREADS_PER_BLOCK][THREADS_PER_BLOCK];
     // loop over each block
     for(int i = 0; i < gridDim.x; i++){
-        // TODO: local transpose
         if(x < N && i * blockDim.y + threadIdx.y < N){
             local_src1[threadIdx.x][threadIdx.y] = src1[x][i * THREADS_PER_BLOCK + threadIdx.y];
         }else{
@@ -39,22 +39,30 @@ __global__ void cudaMultiply(int N, UINT src1[][MAXN], UINT src2[][MAXN], UINT t
             local_src1[threadIdx.x][threadIdx.y] = 0;
         }
         if(i * blockDim.x + threadIdx.x < N && y < N){
+#ifndef USE_TRANSPOSE
             local_src2[threadIdx.x][threadIdx.y] = src2[i * THREADS_PER_BLOCK + threadIdx.x][y];
+#else
             // Transpose version
-            //local_src2[threadIdx.y][threadIdx.x] = src2[i * THREADS_PER_BLOCK + threadIdx.x][y];
+            local_src2[threadIdx.y][threadIdx.x] = src2[i * THREADS_PER_BLOCK + threadIdx.x][y];
+#endif
 
         }else{
             //padding
+#ifndef USE_TRANSPOSE
             local_src2[threadIdx.x][threadIdx.y] = 0;
+#else
             // Transpose padding
-            //local_src2[threadIdx.y][threadIdx.x] = 0;
+            local_src2[threadIdx.y][threadIdx.x] = 0;
+#endif
         }
         __syncthreads();
         // local matrix multiplication
         for(int j = 0; j < THREADS_PER_BLOCK; j++){
-            // TODO: Cache miss(can optimize by transposing matrix above)
+#ifndef USE_TRANSPOSE
             sum += local_src1[threadIdx.x][j] * local_src2[j][threadIdx.y];
-            //sum += local_src1[threadIdx.x][j] * local_src2[threadIdx.y][j];
+#else
+            sum += local_src1[threadIdx.x][j] * local_src2[threadIdx.y][j];
+#endif
         }
         // Move to next block 
         __syncthreads();
@@ -199,6 +207,7 @@ int main() {
         // BA
         cudaMultiply<<< dimGrid, dimBlock >>>(n, cudaB[currentGPU], cudaA[currentGPU], cudaBA[currentGPU]);
         // AB+BA
+        // Note: default stream will sync, so this is redundant
         cudaDeviceSynchronize(); // make sure AB, BA are done
         cudaAdd<<< dimGrid, dimBlock >>>(n, cudaAB[currentGPU], cudaBA[currentGPU], cudaX[currentGPU]);
         // ABA
