@@ -3,12 +3,11 @@
 #include <string.h>
 #include <assert.h>
 #include <omp.h>
-//#define DEBUG
 #define UINT uint32_t
 #define MAXN 1024
 #define MAXGPU 2
 #define MAX_TESTCASE 512
-#define THREADS_PER_BLOCK 32
+#define THREADS_PER_BLOCK 16
 // in-place transpose
 __global__ void cudaTranspose(int N, UINT target[][MAXN]){
     // Share works among row index
@@ -26,33 +25,41 @@ __global__ void cudaTranspose(int N, UINT target[][MAXN]){
 // TODO: Fix out of range multiplication error
 __global__ void cudaMultiply(int N, UINT src1[][MAXN], UINT src2[][MAXN], UINT target[][MAXN]){
     UINT sum = 0;
+    int x = blockIdx.x * blockDim.x + threadIdx.x; // target's x
+    int y = blockIdx.y * blockDim.y + threadIdx.y; // target's y
     __shared__ UINT local_src1[THREADS_PER_BLOCK][THREADS_PER_BLOCK];
     __shared__ UINT local_src2[THREADS_PER_BLOCK][THREADS_PER_BLOCK];
     // loop over each block
     for(int i = 0; i < gridDim.x; i++){
         // TODO: local transpose
-        if(blockIdx.x * blockDim.x + threadIdx.x < N && i * blockDim.y + threadIdx.y < N){
-            local_src1[threadIdx.x][threadIdx.y] = src1[blockIdx.x * THREADS_PER_BLOCK + threadIdx.x][i * THREADS_PER_BLOCK + threadIdx.y];
+        if(x < N && i * blockDim.y + threadIdx.y < N){
+            local_src1[threadIdx.x][threadIdx.y] = src1[x][i * THREADS_PER_BLOCK + threadIdx.y];
         }else{
             // padding
             local_src1[threadIdx.x][threadIdx.y] = 0;
         }
-        if(i * blockDim.x + threadIdx.x < N && blockIdx.y * blockDim.y + threadIdx.y < N){
-            local_src2[threadIdx.x][threadIdx.y] = src2[i * THREADS_PER_BLOCK + threadIdx.x][blockIdx.y * THREADS_PER_BLOCK + threadIdx.y];
+        if(i * blockDim.x + threadIdx.x < N && y < N){
+            local_src2[threadIdx.x][threadIdx.y] = src2[i * THREADS_PER_BLOCK + threadIdx.x][y];
+            // Transpose version
+            //local_src2[threadIdx.y][threadIdx.x] = src2[i * THREADS_PER_BLOCK + threadIdx.x][y];
+
         }else{
             //padding
             local_src2[threadIdx.x][threadIdx.y] = 0;
+            // Transpose padding
+            //local_src2[threadIdx.y][threadIdx.x] = 0;
         }
         __syncthreads();
         // local matrix multiplication
         for(int j = 0; j < THREADS_PER_BLOCK; j++){
             // TODO: Cache miss(can optimize by transposing matrix above)
             sum += local_src1[threadIdx.x][j] * local_src2[j][threadIdx.y];
+            //sum += local_src1[threadIdx.x][j] * local_src2[threadIdx.y][j];
         }
         // Move to next block 
         __syncthreads();
     }
-    target[blockIdx.x * blockDim.x + threadIdx.x][blockIdx.y * blockDim.y + threadIdx.y] = sum;
+    target[x][y] = sum;
 }
 __global__ void cudaAdd(int N, UINT src1[][MAXN], UINT src2[][MAXN], UINT target[][MAXN]){
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -123,6 +130,14 @@ int main() {
     int count = 0;
     cudaGetDeviceCount(&count);
     printf("DeviceCount: %d\n", count);
+    struct cudaDeviceProp prop;
+    for(int i = 0; i < MAXGPU; i++){
+        printf("Device %d\n:", i);
+        cudaGetDeviceProperties(&prop, i);
+        printf("maxThreadsDim: %d %d %d\n", prop.maxThreadsDim[0], prop.maxThreadsDim[1], prop.maxThreadsDim[2]);
+        printf("maxThreadsPerBlock: %d\n", prop.maxThreadsPerBlock);
+        assert(THREADS_PER_BLOCK * THREADS_PER_BLOCK <= prop.maxThreadsPerBlock);
+    }
 #endif
     // allocate memory to each GPU device
     for(int i = 0; i < MAXGPU; i++){
