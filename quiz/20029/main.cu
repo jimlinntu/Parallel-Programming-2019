@@ -2,7 +2,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
-#define DEBUG
+#include <omp.h>
+//#define DEBUG
 #define UINT uint32_t
 #define MAXN 1024
 #define MAXGPU 2
@@ -102,7 +103,11 @@ void host2device(UINT cudaMem[][MAXN], UINT hostMem[][MAXN]){
     assert(error == cudaSuccess);
 }
 
-UINT signatures[MAX_TESTCASE];
+typedef struct Signature_{
+    UINT X,Y;
+} Signature;
+
+Signature signatures[MAX_TESTCASE];
 UINT X[MAXGPU][MAXN][MAXN], Y[MAXGPU][MAXN][MAXN];
 UINT A[MAXGPU][MAXN][MAXN], B[MAXGPU][MAXN][MAXN];
 UINT (*cudaX[MAXGPU])[MAXN], (*cudaY[MAXGPU])[MAXN];
@@ -111,11 +116,18 @@ UINT (*cudaAB[MAXGPU])[MAXN], (*cudaBA[MAXGPU])[MAXN];
 UINT (*cudaABA[MAXGPU])[MAXN], (*cudaBAB[MAXGPU])[MAXN];
 int main() {
     int N[MAX_TESTCASE], S[MAX_TESTCASE][2]; // TODO: May have bug because S_i <= 2^31
-    int currentGPU = 0;
     int testcase_num = 0;
+    omp_set_num_threads(MAXGPU);
     cudaError_t ret;
+#ifdef DEBUG
+    int count = 0;
+    cudaGetDeviceCount(&count);
+    printf("DeviceCount: %d\n", count);
+#endif
     // allocate memory to each GPU device
     for(int i = 0; i < MAXGPU; i++){
+        ret = cudaSetDevice(i);
+        assert(ret == cudaSuccess);
         ret = cudaMalloc(&cudaX[i], sizeof(UINT) * MAXN * MAXN);
         assert(ret == cudaSuccess);
         ret = cudaMalloc(&cudaY[i], sizeof(UINT) * MAXN * MAXN);
@@ -139,8 +151,13 @@ int main() {
     }
     assert(testcase_num <= MAX_TESTCASE);
     // Multi-GPU load balancing
+#pragma omp parallel for schedule(dynamic, 1) 
     for(int i = 0; i < testcase_num; i++){
-        currentGPU = i % MAXGPU;
+        int currentGPU = omp_get_thread_num();
+        assert(currentGPU < MAXGPU);
+#ifdef DEBUG
+        printf("currentGPU: %d\n", currentGPU);
+#endif
         ret = cudaSetDevice(currentGPU);
         assert(ret == cudaSuccess);
         int n = N[i], s_a = S[i][0], s_b = S[i][1];
@@ -178,9 +195,13 @@ int main() {
         cudaAdd<<< dimGrid, dimBlock >>>(n, cudaABA[currentGPU], cudaBAB[currentGPU], cudaY[currentGPU]);
         // [*] Print results
         device2host(cudaX[currentGPU], X[currentGPU]);
-        printf("%u\n", signature(n, X[currentGPU]));
         device2host(cudaY[currentGPU], Y[currentGPU]);
-        printf("%u\n", signature(n, Y[currentGPU]));
+        signatures[i].X = signature(n, X[currentGPU]);
+        signatures[i].Y = signature(n, Y[currentGPU]);
+    }
+    for(int i = 0; i < testcase_num; i++){
+        printf("%u\n", signatures[i].X);
+        printf("%u\n", signatures[i].Y);
     }
     for(int i = 0; i < MAXGPU; i++){
         cudaFree(cudaX[i]);
