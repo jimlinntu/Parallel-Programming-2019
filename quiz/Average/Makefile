@@ -1,0 +1,37 @@
+INPUT = /user/hadoop/avg-input/avg-input.large
+OUTPUT = avg-output
+
+INPUT_SMALL = /user/hadoop/avg-input/avg-input.small
+OUTPUT_SMALL = avg-output-small
+
+JAR = Average.jar
+CP = $(shell hadoop classpath)
+
+.PHONY: all test clean 
+
+all: ${JAR}
+
+Average.jar: ./src/*.java
+	mkdir -p ./bin
+#	hadoop com.sun.tools.javac.Main -d ./bin ./src/*.java
+	javac -cp ${CP} -d ./bin ./src/*.java
+	jar -cvf $@ -C ./bin .
+
+test:
+	-hdfs dfs -rm -r -f $(OUTPUT)
+	-rm -rf local-$(OUTPUT)
+	hadoop jar Average.jar Average $(INPUT) $(OUTPUT)
+	hdfs dfs -copyToLocal $(OUTPUT) local-$(OUTPUT)	
+
+test-small:
+	-hdfs dfs -rm -r -f $(OUTPUT_SMALL)
+	-rm -rf local-$(OUTPUT_SMALL)
+	hadoop jar Average.jar Average $(INPUT_SMALL) $(OUTPUT_SMALL)
+	hdfs dfs -copyToLocal $(OUTPUT_SMALL) local-$(OUTPUT_SMALL)	
+
+clean:
+	-rm -rf ./bin
+	-rm $(JAR)
+	-hdfs dfs -rm -r -f $(OUTPUT)
+	-rm -rf local-$(OUTPUT)
+
